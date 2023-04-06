@@ -107,8 +107,9 @@ def train(
               "Calculated gradient_accumulation_steps is 0. Check your WORLD_SIZE, "
               "batch_size and micro_batch_size. WORLD_SIZE x micro_batch_size should equal to batch_size",)
 
-        gradient_accumulation_steps = world_size * micro_batch_size
-        print(f"Auto adjusted gradient_accumulation_steps to {gradient_accumulation_steps}",
+        batch_size = world_size * micro_batch_size
+        gradient_accumulation_steps = 1
+        print(f"Auto adjusted gradient_accumulation_steps to 1, Fixed batch_size to {batch_size}",
               f"using formula: word_size:{world_size} x micro_batch_size:{micro_batch_size}")
 
     # Ensure value is min 1
