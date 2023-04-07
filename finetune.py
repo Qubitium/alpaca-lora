@@ -12,13 +12,14 @@ from peft import (
     prepare_model_for_int8_training,
     set_peft_model_state_dict,
 )
-from transformers import LlamaForCausalLM, LlamaTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from utils.prompter import Prompter
 
 
 def train(
         # model/data params
+        logging_steps: int = 1,
         load_8bit: bool = True,  # for 7B, we can load as fp16
         base_model: str = "",  # the only required argument
         train_data_json: List[str] = None,  # json files
@@ -55,10 +56,12 @@ def train(
         wandb_log_model: str = "",  # options: false | true
         resume_from_checkpoint: str = None,  # either training checkpoint or final adapter
         prompt_template: str = "alpaca",  # The prompt template to use, will default to alpaca.
+        padding_side: str = "right",
 ):
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         print(
             f"Training Alpaca-LoRA model with params:\n"
+            f"logging_steps: {logging_steps}\n"
             f"load_8bit: {load_8bit}\n"
             f"base_model: {base_model}\n"
             f"train_data_json: {train_data_json}\n"
@@ -86,6 +89,8 @@ def train(
             f"wandb_log_model: {wandb_log_model}\n"
             f"resume_from_checkpoint: {resume_from_checkpoint or False}\n"
             f"prompt template: {prompt_template}\n"
+            f"padding_side: {padding_side}\n"
+
         )
     assert (
         base_model
@@ -128,19 +133,26 @@ def train(
     if len(wandb_log_model) > 0:
         os.environ["WANDB_LOG_MODEL"] = wandb_log_model
 
-    model = LlamaForCausalLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         base_model,
         load_in_8bit=load_8bit,
         torch_dtype=torch.float16,
         device_map=device_map,
     )
 
-    tokenizer = LlamaTokenizer.from_pretrained(base_model)
+    # transformer head resolves to LlamaTokenizerFast
+    tokenizer = AutoTokenizer.from_pretrained(base_model, use_fast=True)
 
     tokenizer.pad_token_id = (
-        0  # unk. we want this to be different from the eos token
+         0  # unk. we want this to be different from the eos token
     )
-    tokenizer.padding_side = "left"  # Allow batched inference
+
+    # check lit-llama discussion
+    if padding_side != "right" and padding_side != "left":
+        print(f"padding_side only allow allow 'left' or 'right' entered: {padding_side}")
+        exit(1)
+
+    tokenizer.padding_side = padding_side  # Allow batched inference
 
     def tokenize(prompt, add_eos_token=True):
         # there's probably a way to do this with the tokenizer settings
@@ -270,7 +282,7 @@ def train(
             num_train_epochs=num_epochs,
             learning_rate=learning_rate,
             fp16=True,
-            logging_steps=1,
+            logging_steps=logging_steps,
             optim="adamw_torch",
             evaluation_strategy="steps" if val_set_size > 0 else "no",
             save_strategy="steps",
