@@ -154,6 +154,7 @@ docker-compose down --volumes --rmi all
 - [alpaca.cpp](https://github.com/antimatter15/alpaca.cpp), a native client for running Alpaca models on the CPU
 - [Alpaca-LoRA-Serve](https://github.com/deep-diver/Alpaca-LoRA-Serve), a ChatGPT-style interface for Alpaca models
 - [AlpacaDataCleaned](https://github.com/gururise/AlpacaDataCleaned), a project to improve the quality of the Alpaca dataset
+- [GPT-4 Alpaca Data](https://github.com/Instruction-Tuning-with-GPT-4/GPT-4-LLM) a project to port synthetic data creation to GPT-4
 - Various adapter weights (download at own risk):
   - 7B:
     - <https://huggingface.co/tloen/alpaca-lora-7b>
@@ -165,6 +166,7 @@ docker-compose down --volumes --rmi all
     - 🇹🇭 <https://huggingface.co/Thaweewat/thai-buffala-lora-7b-v0-1>
     - 🇩🇪 <https://huggingface.co/thisserand/alpaca_lora_german>
     - 🇵🇱 <https://huggingface.co/mmosiolek/polpaca-lora-7b>
+    - 🇵🇱 <https://huggingface.co/chrisociepa/alpaca-lora-7b-pl>
     - 🇮🇹 <https://huggingface.co/teelinsan/camoscio-7b-llama>
     - 🇷🇺 <https://huggingface.co/IlyaGusev/llama_7b_ru_turbo_alpaca_lora>
     - 🇺🇦 <https://huggingface.co/robinhad/ualpaca-7b-llama>
