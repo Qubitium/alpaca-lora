@@ -260,6 +260,7 @@ def train(
 
     model.print_trainable_parameters()  # Be more transparent about the % of trainable params.
 
+    val_set_size = 0 # default to 0
     if val_set_ratio > 0:
         val_set_size = int(len(data["train"]) * val_set_ratio)
         print("\nCalculated val_set_size: {val_set_size}")
