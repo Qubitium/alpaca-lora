@@ -33,6 +33,8 @@ def train(
         batch_size: int = 128,
         micro_batch_size: int = 4,
         num_epochs: int = 4,
+        lr_scheduler_type: str = "linear",
+        optimizer: str = "adamw_torch",
         learning_rate: float = 3e-4,
         cutoff_len: int = 1024,
         val_set_size: int = 2000,
@@ -56,7 +58,7 @@ def train(
         wandb_log_model: str = "",  # options: false | true
         resume_from_checkpoint: str = None,  # either training checkpoint or final adapter
         prompt_template: str = "alpaca",  # The prompt template to use, will default to alpaca.
-        padding_side: str = "right",
+        padding_side: str = "left",
 ):
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         print(
@@ -70,6 +72,8 @@ def train(
             f"batch_size: {batch_size}\n"
             f"micro_batch_size: {micro_batch_size}\n"
             f"num_epochs: {num_epochs}\n"
+            f"lr_scheduler_type: {lr_scheduler_type}\n"
+            f"optimizer: {optimizer}\n"
             f"learning_rate: {learning_rate}\n"
             f"cutoff_len: {cutoff_len}\n"
             f"save_steps: {save_steps}\n"
@@ -280,10 +284,11 @@ def train(
             gradient_accumulation_steps=gradient_accumulation_steps,
             warmup_ratio=warmup_ratio,
             num_train_epochs=num_epochs,
+            lr_scheduler_type=lr_scheduler_type,
             learning_rate=learning_rate,
             fp16=True,
             logging_steps=logging_steps,
-            optim="adamw_torch",
+            optim=optimizer,
             evaluation_strategy="steps" if val_set_size > 0 else "no",
             save_strategy="steps",
             eval_steps=eval_steps,
