@@ -38,7 +38,7 @@ def train(
         optimizer: str = "adamw_torch",
         learning_rate: float = 3e-4,
         cutoff_len: int = 1024,
-        val_set_size: int = 2000,
+        val_set_ratio: float = 0.05,
         # lora hyperparams
         lora_r: int = 16,
         lora_alpha: int = 16,
@@ -81,7 +81,7 @@ def train(
             f"save_limit: {save_limit}\n"
             f"eval_steps: {eval_steps}\n"
             f"warmup_ratio: {warmup_ratio}\n"
-            f"val_set_size: {val_set_size}\n"
+            f"val_set_ratio: {val_set_ratio}\n"
             f"lora_r: {lora_r}\n"
             f"lora_alpha: {lora_alpha}\n"
             f"lora_dropout: {lora_dropout}\n"
@@ -224,17 +224,17 @@ def train(
     if train_data_json is not None:
         data_json = load_dataset("json", data_files=train_data_json)
         datas.append(data_json["train"])
-        print("\n\ndata_json size: " + str(len(data_json["train"])))
+        print("\ndata_json size: " + str(len(data_json["train"])))
 
     if train_data_set is not None:
         # limit=200000
         temp = load_dataset(train_data_set) # , split=f'train[:{limit}]')
-        print("\n\ndata_set size: " + str(len(temp["train"])))
+        print("\ndata_set size: " + str(len(temp["train"])))
         datas.append(temp["train"])
 
     # merge all datas
     data = {'train': concatenate_datasets(datas)}
-    print("\n\nCombined dataset size: " + str(len(data["train"])))
+    print("\nCombined dataset size: " + str(len(data["train"])))
 
     model = get_peft_model(model, config)
 
@@ -252,15 +252,17 @@ def train(
             )
         # The two files above have a different name depending on how they were saved, but are actually the same.
         if os.path.exists(checkpoint_name):
-            print(f"Restarting from {checkpoint_name}")
+            print(f"\nRestarting from {checkpoint_name}")
             adapters_weights = torch.load(checkpoint_name)
             set_peft_model_state_dict(model, adapters_weights)
         else:
-            print(f"Checkpoint {checkpoint_name} not found")
+            print(f"\nCheckpoint {checkpoint_name} not found")
 
     model.print_trainable_parameters()  # Be more transparent about the % of trainable params.
 
-    if val_set_size > 0:
+    if val_set_ratio > 0:
+        val_set_size = int(len(data["train"]) * val_set_ratio)
+        print("\nCalculated val_set_size: {val_set_size}")
         train_val = data["train"].train_test_split(
             test_size=val_set_size, shuffle=True, seed=42
         )
