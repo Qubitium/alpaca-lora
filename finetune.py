@@ -259,6 +259,11 @@ def train(
     else:
         model.print_trainable_parameters()  # Be more transparent about the % of trainable params.
 
+        if not ddp and torch.cuda.device_count() > 1:
+            # keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
+            model.is_parallelizable = True
+            model.model_parallel = True
+
     if val_set_size > 0:
         train_val = data["train"].train_test_split(
             test_size=val_set_size, shuffle=True, seed=42
@@ -272,11 +277,6 @@ def train(
     else:
         train_data = data["train"].shuffle().map(generate_and_tokenize_prompt)
         val_data = None
-
-    if not ddp and torch.cuda.device_count() > 1:
-        # keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
-        model.is_parallelizable = True
-        model.model_parallel = True
 
     trainer = transformers.Trainer(
         model=model,
