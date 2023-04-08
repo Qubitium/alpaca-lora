@@ -1,5 +1,6 @@
 import os
 import sys
+import typing
 from typing import List
 
 import fire
@@ -56,7 +57,7 @@ def train(
         wandb_run_name: str = "",
         wandb_watch: str = "",  # options: false | gradients | all
         wandb_log_model: str = "",  # options: false | true
-        resume_from_checkpoint: str = None,  # either training checkpoint or final adapter
+        resume_from_checkpoint: typing.Union[str, bool] = None,  # either training checkpoint or final adapter
         prompt_template: str = "alpaca",  # The prompt template to use, will default to alpaca.
         padding_side: str = "left",
 ):
@@ -253,16 +254,11 @@ def train(
         if os.path.exists(checkpoint_name):
             print(f"Restarting from {checkpoint_name}")
             adapters_weights = torch.load(checkpoint_name)
-            model = set_peft_model_state_dict(model, adapters_weights)
+            set_peft_model_state_dict(model, adapters_weights)
         else:
             print(f"Checkpoint {checkpoint_name} not found")
-    else:
-        model.print_trainable_parameters()  # Be more transparent about the % of trainable params.
 
-        if not ddp and torch.cuda.device_count() > 1:
-            # keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
-            model.is_parallelizable = True
-            model.model_parallel = True
+    model.print_trainable_parameters()  # Be more transparent about the % of trainable params.
 
     if val_set_size > 0:
         train_val = data["train"].train_test_split(
@@ -277,6 +273,11 @@ def train(
     else:
         train_data = data["train"].shuffle().map(generate_and_tokenize_prompt)
         val_data = None
+
+    if not ddp and torch.cuda.device_count() > 1:
+        # keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
+        model.is_parallelizable = True
+        model.model_parallel = True
 
     trainer = transformers.Trainer(
         model=model,
