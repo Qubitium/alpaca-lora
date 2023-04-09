@@ -1,14 +1,11 @@
 import os
 
 import torch
-import transformers
 from peft import PeftModel
-from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaForCausalLM  # noqa: F402
+from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: F402
 
-BASE_MODEL = os.environ.get("BASE_MODEL", None)
-assert (
-    BASE_MODEL
-), "Please specify a value for BASE_MODEL environment variable, e.g. `export BASE_MODEL=decapoda-research/llama-7b-hf`"  # noqa: E501
+BASE_MODEL = ""
+LORA_ADAPTER = ""
 
 tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, use_fast=True)
 
@@ -19,43 +16,22 @@ base_model = AutoModelForCausalLM.from_pretrained(
     device_map={"": "cpu"},
 )
 
+# save first weight for diff testing
 first_weight = base_model.model.layers[0].self_attn.q_proj.weight
 first_weight_old = first_weight.clone()
 
 lora_model = PeftModel.from_pretrained(
     base_model,
-    "tloen/alpaca-lora-7b",
+    LORA_ADAPTER,
     device_map={"": "cpu"},
     torch_dtype=torch.float16,
     #peft[head] must include this or else it does not mod params
     is_trainable=True,
 )
 
-lora_weight = lora_model.base_model.model.model.layers[
-    0
-].self_attn.q_proj.weight
-
-assert torch.allclose(first_weight_old, first_weight)
-
-# merge weights
-for layer in lora_model.base_model.model.model.layers:
-    layer.self_attn.q_proj.merge_weights = True
-    layer.self_attn.k_proj.merge_weights = True
-    layer.self_attn.v_proj.merge_weights = True
-    layer.self_attn.o_proj.merge_weights = True
-
-lora_model.train(False)
+lora_model.merge_and_unload()
 
 # did we do anything?
 assert not torch.allclose(first_weight_old, first_weight)
 
-lora_model_sd = lora_model.state_dict()
-deloreanized_sd = {
-    k.replace("base_model.model.", ""): v
-    for k, v in lora_model_sd.items()
-    if "lora" not in k
-}
-
-LlamaForCausalLM.save_pretrained(
-    base_model, "./hf_ckpt", state_dict=deloreanized_sd, max_shard_size="500MB"
-)
+lora_model.save_pretrained("./hf_ckpt", max_shard_size="500MB")
