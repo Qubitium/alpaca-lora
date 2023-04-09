@@ -27,6 +27,8 @@ lora_model = PeftModel.from_pretrained(
     "tloen/alpaca-lora-7b",
     device_map={"": "cpu"},
     torch_dtype=torch.float16,
+    #peft[head] must include this or else it does not mod params
+    is_trainable=True,
 )
 
 lora_weight = lora_model.base_model.model.model.layers[
@@ -38,7 +40,9 @@ assert torch.allclose(first_weight_old, first_weight)
 # merge weights
 for layer in lora_model.base_model.model.model.layers:
     layer.self_attn.q_proj.merge_weights = True
+    layer.self_attn.k_proj.merge_weights = True
     layer.self_attn.v_proj.merge_weights = True
+    layer.self_attn.o_proj.merge_weights = True
 
 lora_model.train(False)
 
