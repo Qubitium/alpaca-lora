@@ -45,8 +45,8 @@ def train(
         resume_from_checkpoint: typing.Union[str, bool] = None,  # either training checkpoint or final adapter
         prompt_template: str = "alpaca",  # The prompt template to use, will default to alpaca.
         padding_side: str = "left",
-        fsdp: str =  "full_shard auto_wrap",
-        fsdp_transformer_layer_cls_to_wrap: str = 'LlamaDecoderLayer'
+        # fsdp: str =  "full_shard auto_wrap",
+        # fsdp_transformer_layer_cls_to_wrap: str = 'LlamaDecoderLayer'
         ):
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         print(
@@ -80,8 +80,8 @@ def train(
             f"resume_from_checkpoint: {resume_from_checkpoint or False}\n"
             f"prompt template: {prompt_template}\n"
             f"padding_side: {padding_side}\n"
-            f"fsdp: {fsdp}\n"
-            f"fsdp_transformer_layer_cls_to_wrap: {fsdp_transformer_layer_cls_to_wrap}\n"
+            # f"fsdp: {fsdp}\n"
+            # f"fsdp_transformer_layer_cls_to_wrap: {fsdp_transformer_layer_cls_to_wrap}\n"
 
         )
     assert (
@@ -258,8 +258,8 @@ def train(
             learning_rate=learning_rate,
             bf16=bf16,
             tf32=tf32,
-            fsdp=fsdp,
-            fsdp_transformer_layer_cls_to_wrap=fsdp_transformer_layer_cls_to_wrap,
+            # fsdp=fsdp,
+            # fsdp_transformer_layer_cls_to_wrap=fsdp_transformer_layer_cls_to_wrap,
             logging_steps=logging_steps,
             optim=optimizer,
             evaluation_strategy="steps" if val_set_size > 0 else "no",
