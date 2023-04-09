@@ -13,7 +13,8 @@ from utils.prompter import Prompter
 
 def train(
         # model/data params
-        fp16: bool = True,
+        bf16: bool = True,
+        tf32: bool = True,
         gradient_checkpointing: bool = False,
         logging_steps: int = 1,
         base_model: str = "",  # the only required argument
@@ -44,11 +45,14 @@ def train(
         resume_from_checkpoint: typing.Union[str, bool] = None,  # either training checkpoint or final adapter
         prompt_template: str = "alpaca",  # The prompt template to use, will default to alpaca.
         padding_side: str = "left",
-):
+        fsdp: str =  "full_shard auto_wrap",
+        fsdp_transformer_layer_cls_to_wrap: str = 'LlamaDecoderLayer'
+        ):
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         print(
             f"Training model with params:\n"
-            f"fp16: {fp16}\n"
+            f"bf16: {bf16}\n"
+            f"tf32: {tf32}\n"
             f"gradient_checkpointing: {gradient_checkpointing}\n"
             f"logging_steps: {logging_steps}\n"
             f"base_model: {base_model}\n"
@@ -76,6 +80,8 @@ def train(
             f"resume_from_checkpoint: {resume_from_checkpoint or False}\n"
             f"prompt template: {prompt_template}\n"
             f"padding_side: {padding_side}\n"
+            f"fsdp: {fsdp}\n"
+            f"fsdp_transformer_layer_cls_to_wrap: {fsdp_transformer_layer_cls_to_wrap}\n"
 
         )
     assert (
@@ -250,7 +256,10 @@ def train(
             num_train_epochs=num_epochs,
             lr_scheduler_type=lr_scheduler_type,
             learning_rate=learning_rate,
-            fp16=fp16,
+            bf16=bf16,
+            tf32=tf32,
+            fsdp=fsdp,
+            fsdp_transformer_layer_cls_to_wrap=fsdp_transformer_layer_cls_to_wrap,
             logging_steps=logging_steps,
             optim=optimizer,
             evaluation_strategy="steps" if val_set_size > 0 else "no",
