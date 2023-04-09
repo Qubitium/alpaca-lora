@@ -212,7 +212,7 @@ def train(
             print(f"Resume failed: can't find pytorch_model.bin in checkpoint path: {resume_from_checkpoint}")
             exit(1)
 
-    model.print_trainable_parameters()  # Be more transparent about the % of trainable params.
+    # LlamaModel not supported: model.print_trainable_parameters()  # Be more transparent about the % of trainable params.
 
     val_set_size = 0 # default to 0
     if val_set_ratio > 0:
