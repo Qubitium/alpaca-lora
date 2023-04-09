@@ -13,6 +13,7 @@ from utils.prompter import Prompter
 
 def train(
         # model/data params
+        fp16: bool = True,
         gradient_checkpointing: bool = False,
         logging_steps: int = 1,
         base_model: str = "",  # the only required argument
@@ -47,6 +48,7 @@ def train(
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         print(
             f"Training model with params:\n"
+            f"fp16: {fp16}\n"
             f"gradient_checkpointing: {gradient_checkpointing}\n"
             f"logging_steps: {logging_steps}\n"
             f"base_model: {base_model}\n"
@@ -248,7 +250,7 @@ def train(
             num_train_epochs=num_epochs,
             lr_scheduler_type=lr_scheduler_type,
             learning_rate=learning_rate,
-            fp16=True,
+            fp16=fp16,
             logging_steps=logging_steps,
             optim=optimizer,
             evaluation_strategy="steps" if val_set_size > 0 else "no",
