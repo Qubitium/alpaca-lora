@@ -13,6 +13,7 @@ from utils.prompter import Prompter
 
 def train(
         # model/data params
+        gradient_checkpointing: bool = True,
         logging_steps: int = 1,
         base_model: str = "",  # the only required argument
         train_data_json: List[str] = None,  # json files
@@ -46,6 +47,7 @@ def train(
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         print(
             f"Training model with params:\n"
+            f"gradient_checkpointing: {gradient_checkpointing}\n"
             f"logging_steps: {logging_steps}\n"
             f"base_model: {base_model}\n"
             f"train_data_json: {train_data_json}\n"
@@ -239,6 +241,7 @@ def train(
         train_dataset=train_data,
         eval_dataset=val_data,
         args=transformers.TrainingArguments(
+            gradient_checkpointing=gradient_checkpointing,
             per_device_train_batch_size=micro_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
             warmup_ratio=warmup_ratio,
