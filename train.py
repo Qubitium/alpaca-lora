@@ -13,7 +13,7 @@ from utils.prompter import Prompter
 
 def train(
         # model/data params
-        gradient_checkpointing: bool = True,
+        gradient_checkpointing: bool = False,
         logging_steps: int = 1,
         base_model: str = "",  # the only required argument
         train_data_json: List[str] = None,  # json files
