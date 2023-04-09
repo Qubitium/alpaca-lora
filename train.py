@@ -274,6 +274,7 @@ def train(
 
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
+    trainer.save_state(output_dir)
     model.save_pretrained(output_dir)
 
     print(
