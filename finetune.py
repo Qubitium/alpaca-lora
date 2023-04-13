@@ -24,7 +24,7 @@ def train(
         load_8bit: bool = True,  # for 7B, we can load as fp16
         base_model: str = "",  # the only required argument
         train_data_json: List[str] = None,  # json files
-        train_data_set: List[str] = None,  # dataset
+        train_data_set: str = None,  # dataset
         output_dir: str = "./lora-alpaca",
         # training hyperparams
         warmup_ratio: float = 0.03,
@@ -228,7 +228,8 @@ def train(
 
     if train_data_set is not None:
         # limit=200000
-        for d in train_data_set:
+        dataset_list = train_data_set.split(',')
+        for d in dataset_list:
             print(f"\nLoading dataset: {d}")
             temp = load_dataset(d) # , split=f'train[:{limit}]')
             print("\ndata_set size: " + str(len(temp["train"])))
