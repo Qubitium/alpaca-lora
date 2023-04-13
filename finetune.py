@@ -229,6 +229,7 @@ def train(
     if train_data_set is not None:
         # limit=200000
         for d in train_data_set:
+            print(f"\nLoading dataset: {d}")
             temp = load_dataset(d) # , split=f'train[:{limit}]')
             print("\ndata_set size: " + str(len(temp["train"])))
             datas.append(temp["train"])
