@@ -32,9 +32,9 @@ print(model)
 
 print("Merging lora into base\n")
 # merge peft finetune into base model
-model.merge_and_unload()
-print(model)
+merged = model.merge_and_unload()
+print(merged)
 
 print("Saving merged base\n")
 # use safetensors by default
-model.save_pretrained("./hf_ckpt", max_shard_size="1GB", safe_serialization=True)
+merged.save_pretrained("./merged", max_shard_size="1GB", safe_serialization=True)
