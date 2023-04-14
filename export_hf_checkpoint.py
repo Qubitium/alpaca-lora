@@ -7,8 +7,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 BASE_MODEL = ""
 LORA_ADAPTER = ""
 
+print("Loading tokenizer\n")
 tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, use_fast=True)
 
+print("Loading model\n")
 model = AutoModelForCausalLM.from_pretrained(
     BASE_MODEL,
     load_in_8bit=False,
@@ -16,6 +18,7 @@ model = AutoModelForCausalLM.from_pretrained(
     device_map={"": "cpu"},
 )
 
+print("Loading lora\n")
 model = PeftModel.from_pretrained(
     model,
     LORA_ADAPTER,
@@ -25,8 +28,10 @@ model = PeftModel.from_pretrained(
     is_trainable=True,
 )
 
+print("Merging lora into base\n")
 # merge peft finetune into base model
 model.merge_and_unload()
 
+print("Saving merged base\n")
 # use safetensors by default
 model.save_pretrained("./hf_ckpt", max_shard_size="1GB", safe_serialization=True)
