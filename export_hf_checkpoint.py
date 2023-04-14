@@ -17,6 +17,7 @@ model = AutoModelForCausalLM.from_pretrained(
     torch_dtype=torch.float16,
     device_map={"": "cpu"},
 )
+print(model)
 
 print("Loading lora\n")
 model = PeftModel.from_pretrained(
@@ -27,10 +28,12 @@ model = PeftModel.from_pretrained(
     # peft[head] must include this or else it does not mod params
     is_trainable=True,
 )
+print(model)
 
 print("Merging lora into base\n")
 # merge peft finetune into base model
 model.merge_and_unload()
+print(model)
 
 print("Saving merged base\n")
 # use safetensors by default
