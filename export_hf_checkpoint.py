@@ -21,10 +21,12 @@ model = PeftModel.from_pretrained(
     LORA_ADAPTER,
     device_map={"": "cpu"},
     torch_dtype=torch.float16,
-    #peft[head] must include this or else it does not mod params
+    # peft[head] must include this or else it does not mod params
     is_trainable=True,
 )
 
+# merge peft finetune into base model
 model.merge_and_unload()
 
-model.save_pretrained("./hf_ckpt", max_shard_size="500MB")
+# use safetensors by default
+model.save_pretrained("./hf_ckpt", max_shard_size="1GB", safe_serialization=True)
