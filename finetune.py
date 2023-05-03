@@ -34,14 +34,14 @@ def train(
         batch_size: int = 128,
         micro_batch_size: int = 4,
         num_epochs: int = 4,
-        lr_scheduler_type: str = "linear",
+        lr_scheduler_type: str = "cosine",
         optimizer: str = "adamw_apex_fused",
         learning_rate: float = 3e-4,
         cutoff_len: int = 1024,
         val_set_ratio: float = 0.05,
         # lora hyperparams
         lora_r: int = 16,
-        lora_alpha: int = 16,
+        lora_alpha: int = 32,
         lora_dropout: float = 0.05,
         lora_target_modules: List[str] = [
             "q_proj",
