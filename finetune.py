@@ -35,7 +35,7 @@ def train(
         micro_batch_size: int = 4,
         num_epochs: int = 4,
         lr_scheduler_type: str = "cosine",
-        optimizer: str = "adamw_apex_fused",
+        optimizer: str = "adamw_bnb_8bit",
         learning_rate: float = 3e-4,
         cutoff_len: int = 1024,
         val_set_ratio: float = 0.05,
