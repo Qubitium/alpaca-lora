@@ -302,7 +302,7 @@ def train(
             lr_scheduler_type=lr_scheduler_type,
             learning_rate=learning_rate,
             bf16=True,
-            fp16=True,
+            # fp16=True,
             tf32=True,
             logging_steps=logging_steps,
             optim=optimizer,
