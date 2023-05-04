@@ -22,6 +22,8 @@ def train(
         # model/data params
         logging_steps: int = 1,
         load_8bit: bool = True,  # for 7B, we can load as fp16
+        bf16: bool = True,
+        tf32: bool = True,
         base_model: str = "",  # the only required argument
         train_data_json: List[str] = None,  # json files
         train_data_set: str = None,  # dataset
@@ -62,11 +64,20 @@ def train(
         prompt_template: str = "alpaca",  # The prompt template to use, will default to alpaca.
         padding_side: str = "left",
 ):
+    # only one option bf16 or fp16 can be activated
+    if bf16:
+        fp16 = False
+    else:
+        fp16 = True
+
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         print(
             f"Training Alpaca-LoRA model with params:\n"
             f"logging_steps: {logging_steps}\n"
             f"load_8bit: {load_8bit}\n"
+            f"bf16: {bf16}\n"
+            f"fp16: {fp16}\n"
+            f"tf32: {tf32}\n"
             f"base_model: {base_model}\n"
             f"train_data_json: {train_data_json}\n"
             f"train_data_set: {train_data_set}\n"
@@ -301,9 +312,9 @@ def train(
             num_train_epochs=num_epochs,
             lr_scheduler_type=lr_scheduler_type,
             learning_rate=learning_rate,
-            bf16=True,
-            # fp16=True,
-            tf32=True,
+            bf16=bf16,
+            fp16=fp16,
+            tf32=tf32,
             logging_steps=logging_steps,
             optim=optimizer,
             evaluation_strategy="steps" if val_set_size > 0 else "no",
