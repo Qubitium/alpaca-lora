@@ -21,8 +21,9 @@ from utils.prompter import Prompter
 def train(
         # model/data params
         logging_steps: int = 1,
-        load_8bit: bool = True,  # for 7B, we can load as fp16
-        bf16: bool = True,
+        bits: int = 16,  # train in 16bit, 8bit, 4 bit
+        bf16: bool = False,
+        fp16: bool = True,
         tf32: bool = True,
         base_model: str = "",  # the only required argument
         train_data_json: List[str] = None,  # json files
@@ -67,14 +68,12 @@ def train(
     # only one option bf16 or fp16 can be activated
     if bf16:
         fp16 = False
-    else:
-        fp16 = True
 
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         print(
             f"Training Alpaca-LoRA model with params:\n"
             f"logging_steps: {logging_steps}\n"
-            f"load_8bit: {load_8bit}\n"
+            f"bits: {bits}\n"
             f"bf16: {bf16}\n"
             f"fp16: {fp16}\n"
             f"tf32: {tf32}\n"
@@ -156,8 +155,8 @@ def train(
 
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
-        load_in_8bit=load_8bit,
-        torch_dtype=torch.float16,
+        load_in_8bit=(True if bits == 8 else False),
+        torch_dtype=(torch.bfloat16 if bf16 else torch.float16),
         device_map=device_map,
     )
 
@@ -329,7 +328,7 @@ def train(
             report_to="wandb" if use_wandb else None,
             run_name=wandb_run_name if use_wandb else None,
         ),
-        data_collator = DataCollatorWithPadding(
+        data_collator=transformers.DataCollatorForSeq2Seq(
             tokenizer, pad_to_multiple_of=(8 if bf16 or fp16 else None), return_tensors="pt"
         ),
     )
