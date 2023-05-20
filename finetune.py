@@ -21,7 +21,7 @@ from utils.prompter import Prompter
 def train(
         # model/data params
         logging_steps: int = 1,
-        bits: int = 16,  # train in 16bit, 8bit, 4 bit
+        bits: int = 8,  # train in 16bit, 8bit, 4 bit
         bf16: bool = False,
         fp16: bool = True,
         tf32: bool = True,
