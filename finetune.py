@@ -5,6 +5,7 @@ from typing import List
 
 import fire
 import torch
+import torch.nn as nn
 import transformers
 from peft import (
     LoraConfig,
@@ -13,18 +14,19 @@ from peft import (
     prepare_model_for_int8_training,
     set_peft_model_state_dict,
 )
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from utils.prompter import Prompter
 
 
 def train(
         # model/data params
         logging_steps: int = 1,
+        lora: bool = True,  # if use lora/peft
         bits: int = 8,  # train in 16bit, 8bit, 4 bit
         bf16: bool = False,
         fp16: bool = True,
         tf32: bool = True,
+        gradient_checkpointing: bool = True,
         base_model: str = "",  # the only required argument
         train_data_json: List[str] = None,  # json files
         train_data_set: str = None,  # dataset
@@ -69,14 +71,45 @@ def train(
     if bf16:
         fp16 = False
 
+    device_map = {"": "cuda:0"}
+
+    gradient_accumulation_steps = batch_size // micro_batch_size
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    ddp = world_size != 1
+    if ddp:
+        device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
+        gradient_accumulation_steps = gradient_accumulation_steps // world_size
+
+    # warn user if value is 0 and auto fix
+    if gradient_accumulation_steps == 0:
+        print(
+            "-------------- WARNING --------------\n"
+            "Calculated gradient_accumulation_steps is 0. Check your WORLD_SIZE, batch_size and micro_batch_size.\n"
+        )
+
+        batch_size = world_size * micro_batch_size
+        gradient_accumulation_steps = 1
+        print(
+            f"Auto fixed gradient_accumulation_steps to 1 and changed batch_size to {batch_size}",
+            f"using formula: word_size:{world_size} x micro_batch_size:{micro_batch_size} = batch_size:{batch_size}"
+        )
+
+    # Ensure value is min 1
+    gradient_accumulation_steps = max(gradient_accumulation_steps, 1)
+
+    #print(f"gradient_accumulation_steps: {gradient_accumulation_steps}\n")
+
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         print(
             f"Training Alpaca-LoRA model with params:\n"
             f"logging_steps: {logging_steps}\n"
+            f"lora: {lora}\n"
             f"bits: {bits}\n"
             f"bf16: {bf16}\n"
             f"fp16: {fp16}\n"
             f"tf32: {tf32}\n"
+            f"gradient_checkpointing: {gradient_checkpointing}\n"
+            f"gradient_accumulation_steps: {gradient_accumulation_steps}\n"
             f"base_model: {base_model}\n"
             f"train_data_json: {train_data_json}\n"
             f"train_data_set: {train_data_set}\n"
@@ -112,33 +145,9 @@ def train(
     assert (
         base_model
     ), "Please specify a --base_model, e.g. --base_model='decapoda-research/llama-7b-hf'"
-    gradient_accumulation_steps = batch_size // micro_batch_size
+
 
     prompter = Prompter(prompt_template)
-
-    device_map = "auto"
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    ddp = world_size != 1
-    if ddp:
-        device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
-        gradient_accumulation_steps = gradient_accumulation_steps // world_size
-
-    # warn user if value is 0 and auto fix
-    if gradient_accumulation_steps == 0:
-        print(
-            "-------------- WARNING --------------\n"
-            "Calculated gradient_accumulation_steps is 0. Check your WORLD_SIZE, batch_size and micro_batch_size.\n"
-        )
-
-        batch_size = world_size * micro_batch_size
-        gradient_accumulation_steps = 1
-        print(
-            f"Auto fixed gradient_accumulation_steps to 1 and changed batch_size to {batch_size}",
-            f"using formula: word_size:{world_size} x micro_batch_size:{micro_batch_size} = batch_size:{batch_size}"
-        )
-
-    # Ensure value is min 1
-    gradient_accumulation_steps = max(gradient_accumulation_steps, 1)
 
     # Check if parameter passed or if set within environ
     use_wandb = len(wandb_project) > 0 or (
@@ -152,13 +161,8 @@ def train(
         os.environ["WANDB_WATCH"] = wandb_watch
     if len(wandb_log_model) > 0:
         os.environ["WANDB_LOG_MODEL"] = wandb_log_model
-
-    model = AutoModelForCausalLM.from_pretrained(
-        base_model,
-        load_in_8bit=(True if bits == 8 else False),
-        torch_dtype=(torch.bfloat16 if bf16 else torch.float16),
-        device_map=device_map,
-    )
+    if resume_from_checkpoint:
+        os.environ["WANDB_RESUME"] = "Allow"
 
     # transformer head resolves to LlamaTokenizerFast
     tokenizer = AutoTokenizer.from_pretrained(base_model, use_fast=True)
@@ -220,16 +224,94 @@ def train(
                                                                     ]  # could be sped up, probably
         return tokenized_full_prompt
 
-    model = prepare_model_for_int8_training(model)
+    free_in_GB = int(torch.cuda.mem_get_info()[0] / 1024 ** 3)
+    max_memory = f"{free_in_GB - 2}GB"
 
-    config = LoraConfig(
-        r=lora_r,
-        lora_alpha=lora_alpha,
-        target_modules=lora_target_modules,
-        lora_dropout=lora_dropout,
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
+    print(f"device_map: {device_map}\n")
+
+    if bits == 8:
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            # max_memory=max_memory,
+            load_in_8bit=True,
+            torch_dtype=torch.float16, # bnb only supports float16
+            device_map=device_map,
+        )
+
+        model = prepare_model_for_int8_training(model)
+    elif bits == 4:
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            # max_memory=max_memory,
+            load_in_4bit=True,
+            torch_dtype=torch.float16,  # bnb only supports float16
+            device_map=device_map,
+            quantization_config=BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+            ),
+        )
+
+        print(model)
+
+        def prepare_model_for_4bit_training(model, use_gradient_checkpointing=True):
+            r"""
+            This method wraps the entire protocol for preparing a model before running a training. This includes:
+                1- Cast the layernorm in fp32 2- making output embedding layer require grads 3- Add the upcasting of the lm
+                head to fp32
+
+            Args:
+                model, (`transformers.PreTrainedModel`):
+                    The loaded model from `transformers`
+            """
+            loaded_in_4bit = True
+
+            for name, param in model.named_parameters():
+                # freeze base model's layers
+                param.requires_grad = False
+
+            # cast all non INT8 parameters to fp32
+            for param in model.parameters():
+                if (param.dtype == torch.float16) or (param.dtype == torch.bfloat16):
+                    param.data = param.data.to(torch.float32)
+
+            if loaded_in_4bit and use_gradient_checkpointing:
+                # For backward compatibility
+                if hasattr(model, "enable_input_require_grads"):
+                    model.enable_input_require_grads()
+                else:
+
+                    def make_inputs_require_grad(module, input, output):
+                        output.requires_grad_(True)
+
+                    model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+
+                # enable gradient checkpointing for memory efficiency
+                model.gradient_checkpointing_enable()
+
+            return model
+
+        model = prepare_model_for_4bit_training(model)
+        # for param in model.parameters():
+        #     param.requires_grad = False  # freeze the model - train adapters later
+        #     if param.ndim == 1:
+        #         # cast the small parameters (e.g. layernorm) to fp32 for stability
+        #         param.data = param.data.to(torch.float32)
+
+        # model.gradient_checkpointing_enable()  # reduce number of stored activations
+        # model.model.decoder.project_in = lambda x: x.requires_grad_(True)
+
+        # class CastOutputToFloat(nn.Sequential):
+        #     def forward(self, x):
+        #         return super().forward(x).to(torch.float32)
+        #
+        # model.lm_head = CastOutputToFloat(model.lm_head)
+
+        """### Apply LoRA
+        Here comes the magic with `peft`! Let's load a `PeftModel` and specify that we are going to use low-rank adapters (LoRA) using `get_peft_model` utility function from `peft`.
+        """
+
+
 
     from datasets import concatenate_datasets, load_dataset
 
@@ -242,7 +324,6 @@ def train(
         print("\ndata_json size: " + str(len(data_json["train"])))
 
     if train_data_set is not None:
-        # limit=200000
         dataset_list = train_data_set.split(',')
         for d in dataset_list:
             print(f"\nLoading dataset: {d}")
@@ -254,7 +335,46 @@ def train(
     data = {'train': concatenate_datasets(datas)}
     print("\nCombined dataset size: " + str(len(data["train"])))
 
-    model = get_peft_model(model, config)
+    if lora:
+        config = LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            target_modules=lora_target_modules,
+            lora_dropout=lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, config)
+
+        def print_trainable_parameters(model):
+            """
+            Prints the number of trainable parameters in the model.
+            """
+            trainable_params = 0
+            all_param = 0
+            for _, param in model.named_parameters():
+                all_param += param.numel()
+                if param.requires_grad:
+                    trainable_params += param.numel()
+            print(
+                f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}"
+            )
+
+        print_trainable_parameters(model)
+
+    if bits == 4:
+        # Verifying the datatypes.
+        dtypes = {}
+        for _, p in model.named_parameters():
+            dtype = p.dtype
+            if dtype not in dtypes:
+                dtypes[dtype] = 0
+            dtypes[dtype] += p.numel()
+        total = 0
+        for k, v in dtypes.items():
+            total += v
+        for k, v in dtypes.items():
+            print(k, v, v / total)
 
     if resume_from_checkpoint:
         # Check the available weights and load them
@@ -276,7 +396,7 @@ def train(
         else:
             print(f"\nCheckpoint {checkpoint_name} not found")
 
-    model.print_trainable_parameters()  # Be more transparent about the % of trainable params.
+    # model.print_trainable_parameters()  # Be more transparent about the % of trainable params.
 
     val_set_size = 0 # default to 0
     if val_set_ratio > 0:
@@ -296,9 +416,9 @@ def train(
         val_data = None
 
     if not ddp and torch.cuda.device_count() > 1:
-        # keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
-        model.is_parallelizable = True
-        model.model_parallel = True
+       # keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
+       model.is_parallelizable = True
+       model.model_parallel = True
 
     trainer = transformers.Trainer(
         model=model,
@@ -307,6 +427,7 @@ def train(
         args=transformers.TrainingArguments(
             per_device_train_batch_size=micro_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
+            gradient_checkpointing=gradient_checkpointing,
             warmup_ratio=warmup_ratio,
             num_train_epochs=num_epochs,
             lr_scheduler_type=lr_scheduler_type,
@@ -332,16 +453,21 @@ def train(
             tokenizer, pad_to_multiple_of=(8 if bf16 or fp16 else None), return_tensors="pt"
         ),
     )
+
+    # silence the warnings. Please re-enable for inference!
     model.config.use_cache = False
 
-    old_state_dict = model.state_dict
-    model.state_dict = (
-        lambda self, *_, **__: get_peft_model_state_dict(
-            self, old_state_dict()
-        )
-    ).__get__(model, type(model))
+    # 8 bit only
+    if lora and bits == 8:
+        old_state_dict = model.state_dict
+        model.state_dict = (
+            lambda self, *_, **__: get_peft_model_state_dict(
+                self, old_state_dict()
+            )
+        ).__get__(model, type(model))
 
-    if torch.__version__ >= "2" and sys.platform != "win32":
+    # don't use compile for 4bit yet
+    if bits != 4:
         model = torch.compile(model)
 
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
