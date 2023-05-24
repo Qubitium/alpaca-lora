@@ -32,7 +32,8 @@ def print_trainable_parameters(bits, model):
         if param.requires_grad:
             trainable_params += param.numel()
     if bits == 4: trainable_params /= 2
-    print(f"trainable params: {trainable_params} || all params: {all_param} || trainable: {100 * trainable_params / all_param}")
+    print(
+        f"trainable params: {trainable_params} || all params: {all_param} || trainable: {100 * trainable_params / all_param}")
 
 
 def find_all_linear_names(bits, model):
@@ -128,7 +129,7 @@ def train(
     # Ensure value is min 1
     gradient_accumulation_steps = max(gradient_accumulation_steps, 1)
 
-    #print(f"gradient_accumulation_steps: {gradient_accumulation_steps}\n")
+    # print(f"gradient_accumulation_steps: {gradient_accumulation_steps}\n")
 
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         print(
@@ -178,7 +179,6 @@ def train(
         base_model
     ), "Please specify a --base_model, e.g. --base_model='decapoda-research/llama-7b-hf'"
 
-
     prompter = Prompter(prompt_template)
 
     # Check if parameter passed or if set within environ
@@ -200,7 +200,7 @@ def train(
     tokenizer = AutoTokenizer.from_pretrained(base_model, use_fast=True)
 
     tokenizer.pad_token_id = (
-         0  # unk. we want this to be different from the eos token
+        0  # unk. we want this to be different from the eos token
     )
 
     # check lit-llama discussion
@@ -261,14 +261,12 @@ def train(
 
     print(f"device_map: {device_map}\n")
 
-
-
     if bits == 8:
         model = AutoModelForCausalLM.from_pretrained(
             base_model,
             # max_memory=max_memory,
             load_in_8bit=True,
-            torch_dtype=torch.float16, # bnb only supports float16
+            torch_dtype=torch.bfloat16,
             device_map=device_map,
         )
 
@@ -280,7 +278,8 @@ def train(
             load_in_4bit=True,
             torch_dtype=torch.bfloat16,
             device_map=device_map,
-            # doc https://github.com/huggingface/transformers/pull/23479/files#diff-4333c40134efe7287ccda3bdd11e266b90a62629b933bf2cd15fa39cbf23b088R82
+            # doc https://github.com/huggingface/transformers/pull/23479/files#diff
+            # -4333c40134efe7287ccda3bdd11e266b90a62629b933bf2cd15fa39cbf23b088R82
             quantization_config=BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
@@ -295,9 +294,6 @@ def train(
 
         setattr(model, 'model_parallel', True)
         setattr(model, 'is_parallelizable', True)
-
-
-
 
         model.config.torch_dtype = (torch.float32 if fp16 else (torch.bfloat16 if bf16 else torch.float32))
 
@@ -322,8 +318,6 @@ def train(
         Here comes the magic with `peft`! Let's load a `PeftModel` and specify that we are going to use low-rank adapters (LoRA) using `get_peft_model` utility function from `peft`.
         """
 
-
-
     from datasets import concatenate_datasets, load_dataset
 
     datas = []
@@ -338,7 +332,7 @@ def train(
         dataset_list = train_data_set.split(',')
         for d in dataset_list:
             print(f"\nLoading dataset: {d}")
-            temp = load_dataset(d) # , split=f'train[:{limit}]')
+            temp = load_dataset(d)  # , split=f'train[:{limit}]')
             print("\ndata_set size: " + str(len(temp["train"])))
             datas.append(temp["train"])
 
@@ -402,7 +396,7 @@ def train(
 
     print_trainable_parameters(bits, model)
 
-    val_set_size = 0 # default to 0
+    val_set_size = 0  # default to 0
     if val_set_ratio > 0:
         val_set_size = int(len(data["train"]) * val_set_ratio)
         print(f"\nCalculated val_set_size: {val_set_size}")
@@ -419,11 +413,6 @@ def train(
         train_data = data["train"].shuffle().map(generate_and_tokenize_prompt)
         val_data = None
 
-    if not ddp and torch.cuda.device_count() > 1:
-       # keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
-       model.is_parallelizable = True
-       model.model_parallel = True
-
     trainer = transformers.Trainer(
         model=model,
         train_dataset=train_data,
@@ -439,7 +428,6 @@ def train(
             learning_rate=learning_rate,
             bf16=bf16,
             fp16=fp16,
-            # tf32=tf32,
             logging_steps=logging_steps,
             optim=optimizer,
             evaluation_strategy="steps" if val_set_size > 0 else "no",
@@ -449,7 +437,6 @@ def train(
             output_dir=output_dir,
             save_total_limit=save_limit,
             load_best_model_at_end=True if val_set_size > 0 else False,
-            ddp_find_unused_parameters=False if ddp else None,
             group_by_length=group_by_length,
             report_to="wandb" if use_wandb else None,
             run_name=wandb_run_name if use_wandb else None,
@@ -462,21 +449,30 @@ def train(
     # silence the warnings. Please re-enable for inference!
     model.config.use_cache = False
 
+    # Verifying the datatypes.
+    dtypes = {}
+    for _, p in model.named_parameters():
+        dtype = p.dtype
+        if dtype not in dtypes: dtypes[dtype] = 0
+        dtypes[dtype] += p.numel()
+    total = 0
+    for k, v in dtypes.items(): total += v
+    for k, v in dtypes.items():
+        print(k, v, v / total)
 
-    # 8 bit only
-    if lora and bits == 8:
+    if bits < 16:
         old_state_dict = model.state_dict
         model.state_dict = (
-            lambda self, *_, **__: get_peft_model_state_dict(
-                self, old_state_dict()
-            )
+            lambda self, *_, **__: get_peft_model_state_dict(self, old_state_dict())
         ).__get__(model, type(model))
 
-    # don't use compile for 4bit yet
-    if bits != 4:
-        model = torch.compile(model)
+    model = torch.compile(model)
 
-    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+    train_result = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+    metrics = train_result.metrics
+    trainer.log_metrics("train", metrics)
+    trainer.save_metrics("train", metrics)
+    trainer.save_state()
 
     model.save_pretrained(output_dir)
 
