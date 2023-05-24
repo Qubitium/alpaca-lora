@@ -232,30 +232,6 @@ def train(
 
         return result
 
-    def generate_and_tokenize_prompt(data_point):
-        full_prompt = prompter.generate_prompt(
-            data_point["instruction"],
-            data_point["input"],
-            data_point["output"],
-        )
-        tokenized_full_prompt = tokenize(full_prompt)
-        if not train_on_inputs:
-            user_prompt = prompter.generate_prompt(
-                data_point["instruction"], data_point["input"]
-            )
-            tokenized_user_prompt = tokenize(user_prompt, add_eos_token=add_eos_token)
-            user_prompt_len = len(tokenized_user_prompt["input_ids"])
-
-            if add_eos_token:
-                user_prompt_len -= 1
-
-            tokenized_full_prompt["labels"] = [
-                                                  -100
-                                              ] * user_prompt_len + tokenized_full_prompt["labels"][
-                                                                    user_prompt_len:
-                                                                    ]  # could be sped up, probably
-        return tokenized_full_prompt
-
     free_in_GB = int(torch.cuda.mem_get_info()[0] / 1024 ** 3)
     max_memory = f"{free_in_GB - 2}GB"
 
@@ -270,7 +246,7 @@ def train(
             device_map=device_map,
         )
 
-        model = prepare_model_for_int8_training(model)
+
     elif bits == 4:
         model = AutoModelForCausalLM.from_pretrained(
             base_model,
@@ -290,10 +266,12 @@ def train(
             ),
         )
 
+    model = prepare_model_for_int8_training(model, use_gradient_checkpointing=gradient_checkpointing)
     print(model)
 
-    setattr(model, 'model_parallel', True)
-    setattr(model, 'is_parallelizable', True)
+    if not ddp and torch.cuda.device_count() > 1:
+        setattr(model, 'model_parallel', True)
+        setattr(model, 'is_parallelizable', True)
 
     model.config.torch_dtype = (torch.float32 if fp16 else (torch.bfloat16 if bf16 else torch.float32))
 
@@ -357,6 +335,15 @@ def train(
                         module = module.to(torch.bfloat16)
 
     print_trainable_parameters(bits, model)
+
+    def generate_and_tokenize_prompt(data_point):
+        full_prompt = prompter.generate_prompt(
+            data_point["instruction"],
+            data_point["input"],
+            data_point["output"],
+        )
+        tokenized_full_prompt = tokenize(full_prompt)
+        return tokenized_full_prompt
 
     val_set_size = 0  # default to 0
     if val_set_ratio > 0:
@@ -444,7 +431,8 @@ def train(
 
     print("Saving merged base\n")
     # use safetensors by default
-    merged.save_pretrained(output_dir+"/merged", max_shard_size="1GB", safe_serialization=True)
+    merged.save_pretrained(output_dir + "/merged", max_shard_size="1GB", safe_serialization=True)
+
 
 if __name__ == "__main__":
     fire.Fire(train)
