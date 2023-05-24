@@ -438,10 +438,13 @@ def train(
 
     model.save_pretrained(output_dir)
 
-    print(
-        "\n If there's a warning about missing keys above, please disregard :)"
-    )
+    # merge peft finetune into base model
+    merged = model.merge_and_unload()
+    print(merged)
 
+    print("Saving merged base\n")
+    # use safetensors by default
+    merged.save_pretrained(output_dir+"/merged", max_shard_size="1GB", safe_serialization=True)
 
 if __name__ == "__main__":
     fire.Fire(train)
