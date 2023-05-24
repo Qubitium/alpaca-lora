@@ -5,7 +5,7 @@ from typing import List
 
 import fire
 import torch
-import torch.nn as nn
+import bitsandbytes as bnb
 import transformers
 from peft import (
     LoraConfig,
@@ -14,10 +14,39 @@ from peft import (
     prepare_model_for_int8_training,
     set_peft_model_state_dict,
 )
+from peft.tuners.lora import LoraLayer
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from utils.prompter import Prompter
 
 torch.backends.cuda.matmul.allow_tf32 = True
+
+
+def print_trainable_parameters(bits, model):
+    """
+    Prints the number of trainable parameters in the model.
+    """
+    trainable_params = 0
+    all_param = 0
+    for _, param in model.named_parameters():
+        all_param += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+    if bits == 4: trainable_params /= 2
+    print(f"trainable params: {trainable_params} || all params: {all_param} || trainable: {100 * trainable_params / all_param}")
+
+
+def find_all_linear_names(bits, model):
+    cls = bnb.nn.Linear4bit if bits == 4 else (bnb.nn.Linear8bitLt if bits == 8 else torch.nn.Linear)
+    lora_module_names = set()
+    for name, module in model.named_modules():
+        if isinstance(module, cls):
+            names = name.split('.')
+            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
+
+    if 'lm_head' in lora_module_names:  # needed for 16-bit
+        lora_module_names.remove('lm_head')
+    return list(lora_module_names)
+
 
 def train(
         # model/data params
@@ -232,6 +261,8 @@ def train(
 
     print(f"device_map: {device_map}\n")
 
+
+
     if bits == 8:
         model = AutoModelForCausalLM.from_pretrained(
             base_model,
@@ -255,49 +286,23 @@ def train(
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_compute_dtype=torch.bfloat16,
+                llm_int8_threshold=6.0,
+                llm_int8_has_fp16_weight=False,
             ),
         )
 
         print(model)
 
-        def prepare_model_for_4bit_training(model, use_gradient_checkpointing=True):
-            r"""
-            This method wraps the entire protocol for preparing a model before running a training. This includes:
-                1- Cast the layernorm in fp32 2- making output embedding layer require grads 3- Add the upcasting of the lm
-                head to fp32
+        setattr(model, 'model_parallel', True)
+        setattr(model, 'is_parallelizable', True)
 
-            Args:
-                model, (`transformers.PreTrainedModel`):
-                    The loaded model from `transformers`
-            """
-            loaded_in_4bit = True
 
-            for name, param in model.named_parameters():
-                # freeze base model's layers
-                param.requires_grad = False
 
-            # cast all non INT8 parameters to fp32
-            for param in model.parameters():
-                if (param.dtype == torch.float16) or (param.dtype == torch.bfloat16):
-                    param.data = param.data.to(torch.float32)
 
-            if loaded_in_4bit and use_gradient_checkpointing:
-                # For backward compatibility
-                if hasattr(model, "enable_input_require_grads"):
-                    model.enable_input_require_grads()
-                else:
+        model.config.torch_dtype = (torch.float32 if fp16 else (torch.bfloat16 if bf16 else torch.float32))
 
-                    def make_inputs_require_grad(module, input, output):
-                        output.requires_grad_(True)
-
-                    model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
-
-                # enable gradient checkpointing for memory efficiency
-                model.gradient_checkpointing_enable()
-
-            return model
-
-        model = prepare_model_for_4bit_training(model)
+        if gradient_checkpointing:
+            model.gradient_checkpointing_enable()
         # for param in model.parameters():
         #     param.requires_grad = False  # freeze the model - train adapters later
         #     if param.ndim == 1:
@@ -342,6 +347,9 @@ def train(
     print("\nCombined dataset size: " + str(len(data["train"])))
 
     if lora:
+        lora_target_modules = find_all_linear_names(bits, model)
+        print(f"modules: {lora_target_modules}\n")
+
         config = LoraConfig(
             r=lora_r,
             lora_alpha=lora_alpha,
@@ -352,35 +360,25 @@ def train(
         )
         model = get_peft_model(model, config)
 
-        def print_trainable_parameters(model):
-            """
-            Prints the number of trainable parameters in the model.
-            """
-            trainable_params = 0
-            all_param = 0
-            for _, param in model.named_parameters():
-                all_param += param.numel()
-                if param.requires_grad:
-                    trainable_params += param.numel()
-            print(
-                f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}"
-            )
+        if gradient_checkpointing:
+            if hasattr(model, "enable_input_require_grads"):
+                model.enable_input_require_grads()
+            else:
+                def make_inputs_require_grad(module, input, output):
+                    output.requires_grad_(True)
 
-        print_trainable_parameters(model)
+                model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
-    if bits == 4:
-        # Verifying the datatypes.
-        dtypes = {}
-        for _, p in model.named_parameters():
-            dtype = p.dtype
-            if dtype not in dtypes:
-                dtypes[dtype] = 0
-            dtypes[dtype] += p.numel()
-        total = 0
-        for k, v in dtypes.items():
-            total += v
-        for k, v in dtypes.items():
-            print(k, v, v / total)
+    for name, module in model.named_modules():
+        if isinstance(module, LoraLayer):
+            if bf16:
+                module = module.to(torch.bfloat16)
+        if 'norm' in name:
+            module = module.to(torch.float32)
+        if 'lm_head' in name or 'embed_tokens' in name:
+            if hasattr(module, 'weight'):
+                if bf16 and module.weight.dtype == torch.float32:
+                    module = module.to(torch.bfloat16)
 
     if resume_from_checkpoint:
         # Check the available weights and load them
@@ -402,7 +400,7 @@ def train(
         else:
             print(f"\nCheckpoint {checkpoint_name} not found")
 
-    # model.print_trainable_parameters()  # Be more transparent about the % of trainable params.
+    print_trainable_parameters(bits, model)
 
     val_set_size = 0 # default to 0
     if val_set_ratio > 0:
@@ -463,6 +461,7 @@ def train(
 
     # silence the warnings. Please re-enable for inference!
     model.config.use_cache = False
+
 
     # 8 bit only
     if lora and bits == 8:
