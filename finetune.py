@@ -290,33 +290,15 @@ def train(
             ),
         )
 
-        print(model)
+    print(model)
 
-        setattr(model, 'model_parallel', True)
-        setattr(model, 'is_parallelizable', True)
+    setattr(model, 'model_parallel', True)
+    setattr(model, 'is_parallelizable', True)
 
-        model.config.torch_dtype = (torch.float32 if fp16 else (torch.bfloat16 if bf16 else torch.float32))
+    model.config.torch_dtype = (torch.float32 if fp16 else (torch.bfloat16 if bf16 else torch.float32))
 
-        if gradient_checkpointing:
-            model.gradient_checkpointing_enable()
-        # for param in model.parameters():
-        #     param.requires_grad = False  # freeze the model - train adapters later
-        #     if param.ndim == 1:
-        #         # cast the small parameters (e.g. layernorm) to fp32 for stability
-        #         param.data = param.data.to(torch.float32)
-
-        # model.gradient_checkpointing_enable()  # reduce number of stored activations
-        # model.model.decoder.project_in = lambda x: x.requires_grad_(True)
-
-        # class CastOutputToFloat(nn.Sequential):
-        #     def forward(self, x):
-        #         return super().forward(x).to(torch.float32)
-        #
-        # model.lm_head = CastOutputToFloat(model.lm_head)
-
-        """### Apply LoRA
-        Here comes the magic with `peft`! Let's load a `PeftModel` and specify that we are going to use low-rank adapters (LoRA) using `get_peft_model` utility function from `peft`.
-        """
+    if gradient_checkpointing:
+        model.gradient_checkpointing_enable()
 
     from datasets import concatenate_datasets, load_dataset
 
@@ -363,36 +345,16 @@ def train(
 
                 model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
-    for name, module in model.named_modules():
-        if isinstance(module, LoraLayer):
-            if bf16:
-                module = module.to(torch.bfloat16)
-        if 'norm' in name:
-            module = module.to(torch.float32)
-        if 'lm_head' in name or 'embed_tokens' in name:
-            if hasattr(module, 'weight'):
-                if bf16 and module.weight.dtype == torch.float32:
+        for name, module in model.named_modules():
+            if isinstance(module, LoraLayer):
+                if bf16:
                     module = module.to(torch.bfloat16)
-
-    if resume_from_checkpoint:
-        # Check the available weights and load them
-        checkpoint_name = os.path.join(
-            resume_from_checkpoint, "pytorch_model.bin"
-        )  # Full checkpoint
-        if not os.path.exists(checkpoint_name):
-            checkpoint_name = os.path.join(
-                resume_from_checkpoint, "adapter_model.bin"
-            )  # only LoRA model - LoRA config above has to fit
-            resume_from_checkpoint = (
-                False  # So the trainer won't try loading its state
-            )
-        # The two files above have a different name depending on how they were saved, but are actually the same.
-        if os.path.exists(checkpoint_name):
-            print(f"\nRestarting from {checkpoint_name}")
-            adapters_weights = torch.load(checkpoint_name)
-            set_peft_model_state_dict(model, adapters_weights)
-        else:
-            print(f"\nCheckpoint {checkpoint_name} not found")
+            if 'norm' in name:
+                module = module.to(torch.float32)
+            if 'lm_head' in name or 'embed_tokens' in name:
+                if hasattr(module, 'weight'):
+                    if bf16 and module.weight.dtype == torch.float32:
+                        module = module.to(torch.bfloat16)
 
     print_trainable_parameters(bits, model)
 
