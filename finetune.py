@@ -17,6 +17,7 @@ from peft import (
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from utils.prompter import Prompter
 
+torch.backends.cuda.matmul.allow_tf32 = True
 
 def train(
         # model/data params
@@ -25,8 +26,9 @@ def train(
         bits: int = 8,  # train in 16bit, 8bit, 4 bit
         bf16: bool = False,
         fp16: bool = True,
-        tf32: bool = True,
+        # tf32: bool = True,
         gradient_checkpointing: bool = True,
+        max_grad_norm: float = 0.3,
         base_model: str = "",  # the only required argument
         train_data_json: List[str] = None,  # json files
         train_data_set: str = None,  # dataset
@@ -40,14 +42,14 @@ def train(
         micro_batch_size: int = 4,
         num_epochs: int = 4,
         lr_scheduler_type: str = "cosine",
-        optimizer: str = "adamw_bnb_8bit",
+        optimizer: str = "paged_adamw_32bit",
         learning_rate: float = 3e-4,
         cutoff_len: int = 1024,
         val_set_ratio: float = 0.05,
         # lora hyperparams
-        lora_r: int = 16,
-        lora_alpha: int = 32,
-        lora_dropout: float = 0.05,
+        lora_r: int = 64,
+        lora_alpha: int = 16,
+        lora_dropout: float = 0.00,
         lora_target_modules: List[str] = [
             "q_proj",
             "k_proj",
@@ -107,9 +109,10 @@ def train(
             f"bits: {bits}\n"
             f"bf16: {bf16}\n"
             f"fp16: {fp16}\n"
-            f"tf32: {tf32}\n"
+            # f"tf32: {tf32}\n"
             f"gradient_checkpointing: {gradient_checkpointing}\n"
             f"gradient_accumulation_steps: {gradient_accumulation_steps}\n"
+            f"max_grad_norm: {max_grad_norm}\n"
             f"base_model: {base_model}\n"
             f"train_data_json: {train_data_json}\n"
             f"train_data_set: {train_data_set}\n"
@@ -431,13 +434,14 @@ def train(
             per_device_train_batch_size=micro_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
             gradient_checkpointing=gradient_checkpointing,
+            max_grad_norm=max_grad_norm,
             warmup_ratio=warmup_ratio,
             num_train_epochs=num_epochs,
             lr_scheduler_type=lr_scheduler_type,
             learning_rate=learning_rate,
             bf16=bf16,
             fp16=fp16,
-            tf32=tf32,
+            # tf32=tf32,
             logging_steps=logging_steps,
             optim=optimizer,
             evaluation_strategy="steps" if val_set_size > 0 else "no",
