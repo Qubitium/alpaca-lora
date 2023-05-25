@@ -151,7 +151,7 @@ def train(
         wandb_log_model: str = "",  # options: false | true
         resume_from_checkpoint: typing.Union[str, bool] = None,  # either training checkpoint or final adapter
         prompt_template: str = "alpaca",  # The prompt template to use, will default to alpaca.
-        padding_side: str = "left",
+        padding_side: str = "right",
 ):
     # only one option bf16 or fp16 can be activated
     if bf16:
@@ -287,8 +287,8 @@ def train(
 
     model.config.torch_dtype = (torch.float32 if fp16 else (torch.bfloat16 if bf16 else torch.float32))
 
-    #if gradient_checkpointing:
-    #    model.gradient_checkpointing_enable()
+    if gradient_checkpointing:
+        model.gradient_checkpointing_enable()
 
     from datasets import concatenate_datasets, load_dataset
 
@@ -485,7 +485,7 @@ def train(
             lambda self, *_, **__: get_peft_model_state_dict(self, old_state_dict())
         ).__get__(model, type(model))
 
-    # model = torch.compile(model)
+    model = torch.compile(model)
 
     train_result = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
     metrics = train_result.metrics
