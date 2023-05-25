@@ -1,6 +1,8 @@
 import os
+from os.path import exists, join, isdir
 import sys
 import typing
+from typing import Optional, Dict, Sequence
 from typing import List
 
 import fire
@@ -11,15 +13,45 @@ from peft import (
     LoraConfig,
     get_peft_model,
     get_peft_model_state_dict,
-    prepare_model_for_int8_training,
-    set_peft_model_state_dict,
+    prepare_model_for_kbit_training,
+    set_peft_model_state_dict, PeftModel,
 )
 from peft.tuners.lora import LoraLayer
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from utils.prompter import Prompter
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
+IGNORE_INDEX = -100
+DEFAULT_PAD_TOKEN = "[PAD]"
+
+class SavePeftModelCallback(transformers.TrainerCallback):
+    def save_model(self, args, state, kwargs):
+        print('Saving PEFT checkpoint...')
+        if state.best_model_checkpoint is not None:
+            checkpoint_folder = os.path.join(state.best_model_checkpoint, "adapter_model")
+        else:
+            checkpoint_folder = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
+
+        peft_model_path = os.path.join(checkpoint_folder, "adapter_model")
+        kwargs["model"].save_pretrained(peft_model_path)
+
+        pytorch_model_path = os.path.join(checkpoint_folder, "pytorch_model.bin")
+        if os.path.exists(pytorch_model_path):
+            os.remove(pytorch_model_path)
+
+    def on_save(self, args, state, control, **kwargs):
+        self.save_model(args, state, kwargs)
+        return control
+
+    def on_train_end(self, args, state, control, **kwargs):
+        def touch(fname, times=None):
+            with open(fname, 'a'):
+                os.utime(fname, times)
+
+        touch(join(args.output_dir, 'completed'))
+        self.save_model(args, state, kwargs)
 
 def print_trainable_parameters(bits, model):
     """
@@ -47,6 +79,28 @@ def find_all_linear_names(bits, model):
     if 'lm_head' in lora_module_names:  # needed for 16-bit
         lora_module_names.remove('lm_head')
     return list(lora_module_names)
+
+def smart_tokenizer_and_embedding_resize(
+    special_tokens_dict: Dict,
+    tokenizer: transformers.PreTrainedTokenizer,
+    model: transformers.PreTrainedModel,
+):
+    """Resize tokenizer and embedding.
+
+    Note: This is the unoptimized version that may make your embedding size not be divisible by 64.
+    """
+    num_new_tokens = tokenizer.add_special_tokens(special_tokens_dict)
+    model.resize_token_embeddings(len(tokenizer))
+
+    if num_new_tokens > 0:
+        input_embeddings = model.get_input_embeddings().weight.data
+        output_embeddings = model.get_output_embeddings().weight.data
+
+        input_embeddings_avg = input_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
+        output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
+
+        input_embeddings[-num_new_tokens:] = input_embeddings_avg
+        output_embeddings[-num_new_tokens:] = output_embeddings_avg
 
 
 def train(
@@ -108,9 +162,11 @@ def train(
     gradient_accumulation_steps = batch_size // micro_batch_size
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     ddp = world_size != 1
+
     if ddp:
-        device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
-        gradient_accumulation_steps = gradient_accumulation_steps // world_size
+        device_map = {"": "cuda:" + str(int(os.environ.get("LOCAL_RANK") or 0))}
+
+    gradient_accumulation_steps = gradient_accumulation_steps // world_size
 
     # warn user if value is 0 and auto fix
     if gradient_accumulation_steps == 0:
@@ -129,7 +185,177 @@ def train(
     # Ensure value is min 1
     gradient_accumulation_steps = max(gradient_accumulation_steps, 1)
 
-    # print(f"gradient_accumulation_steps: {gradient_accumulation_steps}\n")
+    assert (
+        base_model
+    ), "Please specify a --base_model, e.g. --base_model='meta/llama-7b-hf'"
+
+    prompter = Prompter(prompt_template)
+
+    # Check if parameter passed or if set within environ
+    use_wandb = len(wandb_project) > 0 or (
+            "WANDB_PROJECT" in os.environ and len(os.environ["WANDB_PROJECT"]) > 0
+    )
+
+    # Only overwrite environ if wandb param passed
+    if len(wandb_project) > 0:
+        os.environ["WANDB_PROJECT"] = wandb_project
+    if len(wandb_watch) > 0:
+        os.environ["WANDB_WATCH"] = wandb_watch
+    if len(wandb_log_model) > 0:
+        os.environ["WANDB_LOG_MODEL"] = wandb_log_model
+    if resume_from_checkpoint:
+        os.environ["WANDB_RESUME"] = "Allow"
+
+    # transformer head resolves to LlamaTokenizerFast
+    tokenizer = AutoTokenizer.from_pretrained(
+        base_model,
+        use_fast=True,
+        padding_side=padding_side,
+    )
+
+    def tokenize(prompt, add_eos_token=True):
+        # there's probably a way to do this with the tokenizer settings
+        # but again, gotta move fast
+        result = tokenizer(
+            prompt,
+            truncation=True,
+            max_length=cutoff_len,
+            padding=False,
+            return_tensors=None,
+        )
+        if (
+                result["input_ids"][-1] != tokenizer.eos_token_id
+                and len(result["input_ids"]) < cutoff_len
+                and add_eos_token
+        ):
+            result["input_ids"].append(tokenizer.eos_token_id)
+            result["attention_mask"].append(1)
+
+        result["labels"] = result["input_ids"].copy()
+
+        return result
+
+    free_in_GB = int(torch.cuda.mem_get_info()[0] / 1024 ** 3)
+    max_memory = f"{free_in_GB - 2}GB"
+
+    print(f"device_map: {device_map}\n")
+
+    if bits == 8:
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            # max_memory=max_memory,
+            load_in_8bit=True,
+            torch_dtype=torch.bfloat16,
+            device_map=device_map,
+        )
+    elif bits == 4:
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            # max_memory=max_memory,
+            load_in_4bit=True,
+            torch_dtype=torch.bfloat16,
+            device_map=device_map,
+            # doc https://github.com/huggingface/transformers/pull/23479/files#diff
+            # -4333c40134efe7287ccda3bdd11e266b90a62629b933bf2cd15fa39cbf23b088R82
+            quantization_config=BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                llm_int8_threshold=6.0,
+                llm_int8_has_fp16_weight=False,
+            ),
+        )
+
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=gradient_checkpointing)
+    print(model)
+
+    if tokenizer.pad_token is None:
+        smart_tokenizer_and_embedding_resize(
+            special_tokens_dict=dict(pad_token=DEFAULT_PAD_TOKEN),
+            tokenizer=tokenizer,
+            model=model,
+        )
+
+    if not ddp and torch.cuda.device_count() > 1:
+        # keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
+        model.is_parallelizable = True
+        model.model_parallel = True
+    else:
+        model.is_parallelizable = False
+        model.model_parallel = False
+
+    model.config.torch_dtype = (torch.float32 if fp16 else (torch.bfloat16 if bf16 else torch.float32))
+
+    #if gradient_checkpointing:
+    #    model.gradient_checkpointing_enable()
+
+    from datasets import concatenate_datasets, load_dataset
+
+    datas = []
+
+    # support multi json files
+    if train_data_json is not None:
+        data_json = load_dataset("json", data_files=train_data_json)
+        datas.append(data_json["train"])
+        print("\ndata_json size: " + str(len(data_json["train"])))
+
+    if train_data_set is not None:
+        dataset_list = train_data_set.split(',')
+        for d in dataset_list:
+            print(f"\nLoading dataset: {d}")
+            temp = load_dataset(d)  # , split=f'train[:{limit}]')
+            print("\ndata_set size: " + str(len(temp["train"])))
+            datas.append(temp["train"])
+
+    # merge all datas
+    data = {'train': concatenate_datasets(datas)}
+    print("\nCombined dataset size: " + str(len(data["train"])))
+
+    if lora:
+        lora_target_modules = find_all_linear_names(bits, model)
+        print(f"modules: {lora_target_modules}\n")
+
+        config = LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            target_modules=lora_target_modules,
+            lora_dropout=lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+
+        if resume_from_checkpoint is not None:
+            print("Loading adapters from checkpoint.")
+            model = PeftModel.from_pretrained(model, join(resume_from_checkpoint, 'adapter_model'))
+            for name, p in model.named_parameters():
+                if 'lora' in name:
+                    print(name, p.sum())
+        else:
+            print(f'adding LoRA modules...')
+            model = get_peft_model(model, config)
+
+        model = get_peft_model(model, config)
+
+        if gradient_checkpointing:
+            if hasattr(model, "enable_input_require_grads"):
+                model.enable_input_require_grads()
+            else:
+                def make_inputs_require_grad(module, input, output):
+                    output.requires_grad_(True)
+
+                model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+
+        for name, module in model.named_modules():
+            if isinstance(module, LoraLayer):
+                if bf16:
+                    module = module.to(torch.bfloat16)
+            if 'norm' in name:
+                module = module.to(torch.float32)
+            if 'lm_head' in name or 'embed_tokens' in name:
+                if hasattr(module, 'weight'):
+                    if bf16 and module.weight.dtype == torch.float32:
+                        module = module.to(torch.bfloat16)
 
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         print(
@@ -175,164 +401,6 @@ def train(
             f"padding_side: {padding_side}\n"
 
         )
-    assert (
-        base_model
-    ), "Please specify a --base_model, e.g. --base_model='decapoda-research/llama-7b-hf'"
-
-    prompter = Prompter(prompt_template)
-
-    # Check if parameter passed or if set within environ
-    use_wandb = len(wandb_project) > 0 or (
-            "WANDB_PROJECT" in os.environ and len(os.environ["WANDB_PROJECT"]) > 0
-    )
-
-    # Only overwrite environ if wandb param passed
-    if len(wandb_project) > 0:
-        os.environ["WANDB_PROJECT"] = wandb_project
-    if len(wandb_watch) > 0:
-        os.environ["WANDB_WATCH"] = wandb_watch
-    if len(wandb_log_model) > 0:
-        os.environ["WANDB_LOG_MODEL"] = wandb_log_model
-    if resume_from_checkpoint:
-        os.environ["WANDB_RESUME"] = "Allow"
-
-    # transformer head resolves to LlamaTokenizerFast
-    tokenizer = AutoTokenizer.from_pretrained(base_model, use_fast=True)
-
-    tokenizer.pad_token_id = (
-        0  # unk. we want this to be different from the eos token
-    )
-
-    # check lit-llama discussion
-    if padding_side != "right" and padding_side != "left":
-        print(f"padding_side only allow allow 'left' or 'right' entered: {padding_side}")
-        exit(1)
-
-    tokenizer.padding_side = padding_side  # Allow batched inference
-
-    def tokenize(prompt, add_eos_token=True):
-        # there's probably a way to do this with the tokenizer settings
-        # but again, gotta move fast
-        result = tokenizer(
-            prompt,
-            truncation=True,
-            max_length=cutoff_len,
-            padding=False,
-            return_tensors=None,
-        )
-        if (
-                result["input_ids"][-1] != tokenizer.eos_token_id
-                and len(result["input_ids"]) < cutoff_len
-                and add_eos_token
-        ):
-            result["input_ids"].append(tokenizer.eos_token_id)
-            result["attention_mask"].append(1)
-
-        result["labels"] = result["input_ids"].copy()
-
-        return result
-
-    free_in_GB = int(torch.cuda.mem_get_info()[0] / 1024 ** 3)
-    max_memory = f"{free_in_GB - 2}GB"
-
-    print(f"device_map: {device_map}\n")
-
-    if bits == 8:
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model,
-            # max_memory=max_memory,
-            load_in_8bit=True,
-            torch_dtype=torch.bfloat16,
-            device_map=device_map,
-        )
-
-
-    elif bits == 4:
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model,
-            # max_memory=max_memory,
-            load_in_4bit=True,
-            torch_dtype=torch.bfloat16,
-            device_map=device_map,
-            # doc https://github.com/huggingface/transformers/pull/23479/files#diff
-            # -4333c40134efe7287ccda3bdd11e266b90a62629b933bf2cd15fa39cbf23b088R82
-            quantization_config=BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_compute_dtype=torch.bfloat16,
-                llm_int8_threshold=6.0,
-                llm_int8_has_fp16_weight=False,
-            ),
-        )
-
-    model = prepare_model_for_int8_training(model, use_gradient_checkpointing=gradient_checkpointing)
-    print(model)
-
-    if not ddp and torch.cuda.device_count() > 1:
-        setattr(model, 'model_parallel', True)
-        setattr(model, 'is_parallelizable', True)
-
-    model.config.torch_dtype = (torch.float32 if fp16 else (torch.bfloat16 if bf16 else torch.float32))
-
-    if gradient_checkpointing:
-        model.gradient_checkpointing_enable()
-
-    from datasets import concatenate_datasets, load_dataset
-
-    datas = []
-
-    # support multi json files
-    if train_data_json is not None:
-        data_json = load_dataset("json", data_files=train_data_json)
-        datas.append(data_json["train"])
-        print("\ndata_json size: " + str(len(data_json["train"])))
-
-    if train_data_set is not None:
-        dataset_list = train_data_set.split(',')
-        for d in dataset_list:
-            print(f"\nLoading dataset: {d}")
-            temp = load_dataset(d)  # , split=f'train[:{limit}]')
-            print("\ndata_set size: " + str(len(temp["train"])))
-            datas.append(temp["train"])
-
-    # merge all datas
-    data = {'train': concatenate_datasets(datas)}
-    print("\nCombined dataset size: " + str(len(data["train"])))
-
-    if lora:
-        lora_target_modules = find_all_linear_names(bits, model)
-        print(f"modules: {lora_target_modules}\n")
-
-        config = LoraConfig(
-            r=lora_r,
-            lora_alpha=lora_alpha,
-            target_modules=lora_target_modules,
-            lora_dropout=lora_dropout,
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-        model = get_peft_model(model, config)
-
-        if gradient_checkpointing:
-            if hasattr(model, "enable_input_require_grads"):
-                model.enable_input_require_grads()
-            else:
-                def make_inputs_require_grad(module, input, output):
-                    output.requires_grad_(True)
-
-                model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
-
-        for name, module in model.named_modules():
-            if isinstance(module, LoraLayer):
-                if bf16:
-                    module = module.to(torch.bfloat16)
-            if 'norm' in name:
-                module = module.to(torch.float32)
-            if 'lm_head' in name or 'embed_tokens' in name:
-                if hasattr(module, 'weight'):
-                    if bf16 and module.weight.dtype == torch.float32:
-                        module = module.to(torch.bfloat16)
 
     print_trainable_parameters(bits, model)
 
@@ -385,7 +453,7 @@ def train(
             save_steps=save_steps,
             output_dir=output_dir,
             save_total_limit=save_limit,
-            load_best_model_at_end=True if val_set_size > 0 else False,
+            # load_best_model_at_end=True if val_set_size > 0 else False,
             group_by_length=group_by_length,
             report_to="wandb" if use_wandb else None,
             run_name=wandb_run_name if use_wandb else None,
@@ -394,6 +462,8 @@ def train(
             tokenizer, pad_to_multiple_of=(8 if bf16 or fp16 else None), return_tensors="pt"
         ),
     )
+
+    # NOT WORKING, result in empty model checkpoints trainer.add_callback(SavePeftModelCallback)
 
     # silence the warnings. Please re-enable for inference!
     model.config.use_cache = False
@@ -415,7 +485,7 @@ def train(
             lambda self, *_, **__: get_peft_model_state_dict(self, old_state_dict())
         ).__get__(model, type(model))
 
-    model = torch.compile(model)
+    # model = torch.compile(model)
 
     train_result = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
     metrics = train_result.metrics
@@ -424,15 +494,6 @@ def train(
     trainer.save_state()
 
     model.save_pretrained(output_dir)
-
-    # merge peft finetune into base model
-    merged = model.merge_and_unload()
-    print(merged)
-
-    print("Saving merged base\n")
-    # use safetensors by default
-    merged.save_pretrained(output_dir + "/merged", max_shard_size="1GB", safe_serialization=True)
-
 
 if __name__ == "__main__":
     fire.Fire(train)
