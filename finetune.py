@@ -5,9 +5,12 @@ import typing
 from typing import Optional, Dict, Sequence
 from typing import List
 
+import copy
+from dataclasses import dataclass, field
 import fire
 import torch
 import bitsandbytes as bnb
+from torch.nn.utils.rnn import pad_sequence
 import transformers
 from peft import (
     LoraConfig,
@@ -17,41 +20,11 @@ from peft import (
     set_peft_model_state_dict, PeftModel,
 )
 from peft.tuners.lora import LoraLayer
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, Seq2SeqTrainer
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from utils.prompter import Prompter
 
 torch.backends.cuda.matmul.allow_tf32 = True
-
-IGNORE_INDEX = -100
-DEFAULT_PAD_TOKEN = "[PAD]"
-
-class SavePeftModelCallback(transformers.TrainerCallback):
-    def save_model(self, args, state, kwargs):
-        print('Saving PEFT checkpoint...')
-        if state.best_model_checkpoint is not None:
-            checkpoint_folder = os.path.join(state.best_model_checkpoint, "adapter_model")
-        else:
-            checkpoint_folder = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
-
-        peft_model_path = os.path.join(checkpoint_folder, "adapter_model")
-        kwargs["model"].save_pretrained(peft_model_path)
-
-        pytorch_model_path = os.path.join(checkpoint_folder, "pytorch_model.bin")
-        if os.path.exists(pytorch_model_path):
-            os.remove(pytorch_model_path)
-
-    def on_save(self, args, state, control, **kwargs):
-        self.save_model(args, state, kwargs)
-        return control
-
-    def on_train_end(self, args, state, control, **kwargs):
-        def touch(fname, times=None):
-            with open(fname, 'a'):
-                os.utime(fname, times)
-
-        touch(join(args.output_dir, 'completed'))
-        self.save_model(args, state, kwargs)
 
 def print_trainable_parameters(bits, model):
     """
@@ -79,28 +52,6 @@ def find_all_linear_names(bits, model):
     if 'lm_head' in lora_module_names:  # needed for 16-bit
         lora_module_names.remove('lm_head')
     return list(lora_module_names)
-
-def smart_tokenizer_and_embedding_resize(
-    special_tokens_dict: Dict,
-    tokenizer: transformers.PreTrainedTokenizer,
-    model: transformers.PreTrainedModel,
-):
-    """Resize tokenizer and embedding.
-
-    Note: This is the unoptimized version that may make your embedding size not be divisible by 64.
-    """
-    num_new_tokens = tokenizer.add_special_tokens(special_tokens_dict)
-    model.resize_token_embeddings(len(tokenizer))
-
-    if num_new_tokens > 0:
-        input_embeddings = model.get_input_embeddings().weight.data
-        output_embeddings = model.get_output_embeddings().weight.data
-
-        input_embeddings_avg = input_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
-        output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
-
-        input_embeddings[-num_new_tokens:] = input_embeddings_avg
-        output_embeddings[-num_new_tokens:] = output_embeddings_avg
 
 
 def train(
@@ -213,6 +164,10 @@ def train(
         padding_side=padding_side,
     )
 
+    tokenizer.pad_token_id = (
+         0  # unk. we want this to be different from the eos token
+    )
+
     def tokenize(prompt, add_eos_token=True):
         # there's probably a way to do this with the tokenizer settings
         # but again, gotta move fast
@@ -224,9 +179,9 @@ def train(
             return_tensors=None,
         )
         if (
-                result["input_ids"][-1] != tokenizer.eos_token_id
-                and len(result["input_ids"]) < cutoff_len
-                and add_eos_token
+            result["input_ids"][-1] != tokenizer.eos_token_id
+            and len(result["input_ids"]) < cutoff_len
+            and add_eos_token
         ):
             result["input_ids"].append(tokenizer.eos_token_id)
             result["attention_mask"].append(1)
@@ -235,8 +190,34 @@ def train(
 
         return result
 
-    free_in_GB = int(torch.cuda.mem_get_info()[0] / 1024 ** 3)
-    max_memory = f"{free_in_GB - 2}GB"
+    def generate_and_tokenize_prompt(data_point):
+        full_prompt = prompter.generate_prompt(
+            data_point["instruction"],
+            data_point["input"],
+            data_point["output"],
+        )
+        tokenized_full_prompt = tokenize(full_prompt)
+        if not train_on_inputs:
+            user_prompt = prompter.generate_prompt(
+                data_point["instruction"], data_point["input"]
+            )
+            tokenized_user_prompt = tokenize(
+                user_prompt, add_eos_token=add_eos_token
+            )
+            user_prompt_len = len(tokenized_user_prompt["input_ids"])
+
+            if add_eos_token:
+                user_prompt_len -= 1
+
+            tokenized_full_prompt["labels"] = [
+                                                  -100
+                                              ] * user_prompt_len + tokenized_full_prompt["labels"][
+                                                                    user_prompt_len:
+                                                                    ]  # could be sped up, probably
+        return tokenized_full_prompt
+
+    # free_in_GB = int(torch.cuda.mem_get_info()[0] / 1024 ** 3)
+    # max_memory = f"{free_in_GB - 2}GB"
 
     print(f"device_map: {device_map}\n")
 
@@ -270,20 +251,10 @@ def train(
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=gradient_checkpointing)
     print(model)
 
-    if tokenizer.pad_token is None:
-        smart_tokenizer_and_embedding_resize(
-            special_tokens_dict=dict(pad_token=DEFAULT_PAD_TOKEN),
-            tokenizer=tokenizer,
-            model=model,
-        )
-
     if not ddp and torch.cuda.device_count() > 1:
-        # keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
-        model.is_parallelizable = True
-        model.model_parallel = True
-    else:
-        model.is_parallelizable = False
-        model.model_parallel = False
+       # keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
+       model.is_parallelizable = True
+       model.model_parallel = True
 
     model.config.torch_dtype = (torch.float32 if fp16 else (torch.bfloat16 if bf16 else torch.float32))
 
@@ -404,15 +375,6 @@ def train(
 
     print_trainable_parameters(bits, model)
 
-    def generate_and_tokenize_prompt(data_point):
-        full_prompt = prompter.generate_prompt(
-            data_point["instruction"],
-            data_point["input"],
-            data_point["output"],
-        )
-        tokenized_full_prompt = tokenize(full_prompt)
-        return tokenized_full_prompt
-
     val_set_size = 0  # default to 0
     if val_set_ratio > 0:
         val_set_size = int(len(data["train"]) * val_set_ratio)
@@ -435,6 +397,7 @@ def train(
         train_dataset=train_data,
         eval_dataset=val_data,
         args=transformers.TrainingArguments(
+            ddp_find_unused_parameters=False,
             per_device_train_batch_size=micro_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
             gradient_checkpointing=gradient_checkpointing,
@@ -453,7 +416,7 @@ def train(
             save_steps=save_steps,
             output_dir=output_dir,
             save_total_limit=save_limit,
-            # load_best_model_at_end=True if val_set_size > 0 else False,
+            #load_best_model_at_end=True if val_set_size > 0 else False,
             group_by_length=group_by_length,
             report_to="wandb" if use_wandb else None,
             run_name=wandb_run_name if use_wandb else None,
